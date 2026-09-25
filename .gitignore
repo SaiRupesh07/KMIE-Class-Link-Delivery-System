@@ -1,0 +1,22 @@
+# Environment files
+.env
+backend/.env
+backend/.env.backup
+
+# Python virtual environments
+.venv/
+backend/.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Pytest
+.pytest_cache/
+
+# Frontend dependencies/build
+frontend/node_modules/
+frontend/dist/
+
+# Logs
+*.log

@@ -1,0 +1,3 @@
+const API=import.meta.env.VITE_API_URL||'http://localhost:8000';
+export async function api(path:string,opts:RequestInit={}){const token=localStorage.getItem('token');const headers=new Headers(opts.headers);headers.set('Content-Type','application/json');if(token)headers.set('Authorization',`Bearer ${token}`);const r=await fetch(API+path,{...opts,headers});if(!r.ok){let d:any={};try{d=await r.json()}catch{};throw new Error(d.detail||`Request failed (${r.status})`)}return r.status===204?null:r.json()}
+export function login(email:string,password:string){return api('/api/auth/login',{method:'POST',body:JSON.stringify({email,password})})}
