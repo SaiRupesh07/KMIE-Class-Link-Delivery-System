@@ -7,7 +7,6 @@ A full-stack system for managing class sessions, reviewer approval, student atte
 | Resource | Link |
 |---|---|
 | Frontend | https://kmie-class-link-delivery-system.onrender.com |
-| Backend API | https://kmie-backend.onrender.com |
 | Swagger / OpenAPI | https://kmie-backend.onrender.com/docs |
 | ReDoc | https://kmie-backend.onrender.com/redoc |
 | GitHub Repository | https://github.com/SaiRupesh07/KMIE-Class-Link-Delivery-System |
