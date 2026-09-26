@@ -1,7 +1,13 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
-import { api, login } from "./lib/api";
+import {
+  api,
+  login,
+  getStaffSessionAttendance,
+  updateStaffStudentAttendance,
+  type StaffSessionAttendance,
+} from "./lib/api";
 
 type User = {
   id: string;
@@ -28,6 +34,20 @@ type Session = {
 type Batch = {
   id: string;
   name: string;
+  /** Present when the backend includes enrollment data on
+   *  GET /api/staff/batches. Optional so older/partial backend
+   *  responses never crash the dashboard — see enrolledCountOf(). */
+  enrolled_count?: number;
+  students?: BatchStudent[];
+};
+
+/** One row of the enrolled-students roster embedded in a Batch,
+ *  from GET /api/staff/batches. Staff-only — never rendered for
+ *  Reviewer or Student. */
+type BatchStudent = {
+  student_id: string;
+  name: string;
+  email: string;
 };
 
 /** Real shape of GET /api/staff/report?batch_id=...&date=...
@@ -40,6 +60,8 @@ type StaffReportSession = {
   date: string;
   time: string;
   status: string;
+  subject_name: string;
+  teacher_name: string;
   approved_by: string | null;
   approved_at: string | null;
   enrolled_student_count: number;
@@ -205,6 +227,25 @@ const BarChartIcon = ({ className = "w-4 h-4" }: IconProps) => (
   </svg>
 );
 
+const SearchIcon = ({ className = "w-4 h-4" }: IconProps) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="1.8" />
+    <path d="m20 20-3.2-3.2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+  </svg>
+);
+
+const ChevronLeftIcon = ({ className = "w-4 h-4" }: IconProps) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <path d="M15 18l-6-6 6-6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+
+const ChevronDownIcon = ({ className = "w-4 h-4" }: IconProps) => (
+  <svg viewBox="0 0 24 24" fill="none" className={className}>
+    <path d="m6 9 6 6 6-6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+
 /* =========================================================
    SMALL PRESENTATIONAL PRIMITIVES
 ========================================================= */
@@ -254,6 +295,59 @@ function friendlyError(err: any): string {
   if (/\(401\)/.test(msg) || /\(403\)/.test(msg) || /unauthorized/i.test(msg) || /forbidden/i.test(msg)) {
     return "Staff access required.";
   }
+  if (/\(422\)/.test(msg)) {
+    return "Please check the form for invalid or missing fields.";
+  }
+  if (/\(500\)/.test(msg)) {
+    return "Something went wrong on the server. Please try again.";
+  }
+  return msg || "Something went wrong. Please try again.";
+}
+
+/** General-purpose HTTP error → human message mapper, used anywhere outside
+ *  the session create/edit modal (attendance, approval, delivery actions).
+ *  Never surfaces raw stack traces, SQL, or "[object Object]" — always a
+ *  short, actionable sentence, and falls back to the backend's own message
+ *  when it's already clear (e.g. "Attendance already submitted."). */
+function friendlyActionError(
+  err: any,
+  context?: "attendance" | "approve" | "deliver" | "staffAttendance"
+): string {
+  const msg: string = err?.message || "";
+
+  if (/\(401\)/.test(msg) || /session has expired/i.test(msg)) {
+    return context === "staffAttendance"
+      ? "Your session has expired. Please log in again."
+      : "Your session has expired. Please sign in again.";
+  }
+  if (/\(403\)/.test(msg) || /forbidden/i.test(msg)) {
+    if (context === "staffAttendance") return "You do not have permission to manage attendance.";
+    return context === "attendance"
+      ? "You do not have access to this session."
+      : "You do not have permission to perform this action.";
+  }
+  if (/\(404\)/.test(msg) || /not found/i.test(msg)) {
+    return context === "staffAttendance"
+      ? "Session or student not found."
+      : "That record could not be found. It may have been removed.";
+  }
+  if (/\(409\)/.test(msg) || /already submitted/i.test(msg) || /already recorded/i.test(msg) || /conflict/i.test(msg)) {
+    if (context === "staffAttendance") return "Attendance has already been recorded for this student.";
+    return context === "attendance"
+      ? "Attendance has already been submitted for this session."
+      : "This action conflicts with the current state of the session.";
+  }
+  if (/\(400\)/.test(msg) || /\(422\)/.test(msg)) {
+    return context === "staffAttendance"
+      ? "Please check the attendance details and try again."
+      : "That request was invalid. Please check the details and try again.";
+  }
+  if (/\(500\)/.test(msg)) {
+    return "Something went wrong on the server. Please try again.";
+  }
+  if (/network error/i.test(msg)) {
+    return context === "staffAttendance" ? "Unable to update attendance. Please try again." : msg;
+  }
   return msg || "Something went wrong. Please try again.";
 }
 
@@ -291,6 +385,16 @@ function teacherNameOf(session: Pick<Session, "teacher_name">): string {
   return session.teacher_name || "Teacher not assigned";
 }
 
+/** Enrollment must reflect actual Student records on the batch, never
+ *  be inferred from sessions/attendance. Falls back through whichever
+ *  the backend actually sent: an explicit count, then the students
+ *  array length, then 0 — never crashes on a partial response. */
+function enrolledCountOf(batch: Batch): number {
+  if (typeof batch.enrolled_count === "number") return batch.enrolled_count;
+  if (Array.isArray(batch.students)) return batch.students.length;
+  return 0;
+}
+
 const Badge = ({ children }: { children: React.ReactNode }) => (
   <span className="inline-flex items-center rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600 ring-1 ring-inset ring-slate-200">
     {children}
@@ -306,16 +410,17 @@ const STATUS_STYLES: Record<string, string> = {
   FAILED: "bg-rose-50 text-rose-700 ring-rose-600/20",
   PRESENT: "bg-emerald-50 text-emerald-700 ring-emerald-600/20",
   ABSENT: "bg-rose-50 text-rose-700 ring-rose-600/20",
+  NOT_MARKED: "bg-slate-100 text-slate-500 ring-slate-400/30",
 };
 
-const StatusPill = ({ status }: { status: string }) => (
+const StatusPill = ({ status, label }: { status: string; label?: string }) => (
   <span
     className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-bold tracking-wide ring-1 ring-inset ${
       STATUS_STYLES[status] || "bg-slate-100 text-slate-600 ring-slate-600/20"
     }`}
   >
     <span className="h-1.5 w-1.5 rounded-full bg-current" />
-    {status}
+    {label ?? status}
   </span>
 );
 
@@ -617,6 +722,7 @@ function SessionModal({
   mode,
   batches,
   initialValues,
+  isApprovedEdit,
   onClose,
   onSubmit,
 }: {
@@ -624,6 +730,7 @@ function SessionModal({
   mode: "create" | "edit";
   batches: Batch[];
   initialValues: SessionFormValues;
+  isApprovedEdit?: boolean;
   onClose: () => void;
   onSubmit: (values: SessionFormValues) => Promise<void>;
 }) {
@@ -714,6 +821,16 @@ function SessionModal({
             <XIcon className="h-4 w-4" />
           </button>
         </div>
+
+        {mode === "edit" && isApprovedEdit && (
+          <div className="animate-fade-in mb-5 flex items-start gap-2.5 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-sm text-amber-800">
+            <ClockIcon className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>
+              This session is currently <strong>APPROVED</strong>. Saving any change will return it to{" "}
+              <strong>DRAFT</strong> and require reviewer approval again before it can be delivered.
+            </span>
+          </div>
+        )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
@@ -928,6 +1045,163 @@ function ReportDeliverySummary({
       <DeliveryStatRow label="Sent" value={sent} tone="sent" icon={<CheckIcon className="h-3.5 w-3.5" />} />
       <DeliveryStatRow label="Failed" value={failed} tone="failed" icon={<XIcon className="h-3.5 w-3.5" />} />
       <DeliveryStatRow label="Pending" value={pending} tone="pending" icon={<ClockIcon className="h-3.5 w-3.5" />} />
+    </div>
+  );
+}
+
+/* =========================================================
+   STAFF — BATCH/DATE REPORT GENERATOR (GET /api/staff/report)
+   Standalone filterable panel: Batch + Date -> Generate Report,
+   rendering every session the backend returns for that batch/date
+   (the endpoint is not scoped to a single session).
+========================================================= */
+
+function StaffReportPanel({ batches }: { batches: Batch[] }) {
+  const [batchId, setBatchId] = useState("");
+  const [date, setDate] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState<StaffReportResponse | null>(null);
+
+  async function generate(e: React.FormEvent) {
+    e.preventDefault();
+    if (!batchId || !date) {
+      setError("Select a batch and a date to generate a report.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    setResult(null);
+
+    try {
+      const params = new URLSearchParams({ batch_id: batchId, date });
+      const data = (await api(`/api/staff/report?${params.toString()}`)) as StaffReportResponse;
+      setResult(data);
+    } catch (err: any) {
+      setError(friendlyActionError(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="mb-8 overflow-hidden rounded-2xl border border-slate-200/70 bg-white shadow-sm shadow-slate-200/50">
+      <div className="border-b border-slate-100 p-5">
+        <h3 className="text-lg font-bold text-slate-900">Attendance &amp; Delivery Report</h3>
+        <p className="mt-1 text-sm text-slate-500">
+          Pick a batch and a date to see every session's approval, attendance and delivery counts.
+        </p>
+      </div>
+
+      <form onSubmit={generate} className="flex flex-wrap items-end gap-3 border-b border-slate-100 bg-slate-50/50 p-5">
+        <div>
+          <label className="mb-1.5 block text-xs font-semibold text-slate-600">Batch</label>
+          <select
+            className="rounded-xl border border-slate-200 bg-white p-2.5 text-sm text-slate-900 outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100"
+            value={batchId}
+            onChange={(e) => setBatchId(e.target.value)}
+          >
+            <option value="">Select batch…</option>
+            {batches.map((b) => (
+              <option key={b.id} value={b.id}>
+                {b.name}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div>
+          <label className="mb-1.5 block text-xs font-semibold text-slate-600">Date</label>
+          <input
+            type="date"
+            className="rounded-xl border border-slate-200 bg-white p-2.5 text-sm text-slate-900 outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100"
+            value={date}
+            onChange={(e) => setDate(e.target.value)}
+          />
+        </div>
+
+        <button
+          type="submit"
+          disabled={loading}
+          className="flex items-center gap-1.5 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {loading ? <Spinner className="h-4 w-4" /> : <BarChartIcon className="h-4 w-4" />}
+          {loading ? "Generating report..." : "Generate Report"}
+        </button>
+      </form>
+
+      <div className="p-5">
+        {error && (
+          <p className="mb-4 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
+            <XIcon className="mt-0.5 h-4 w-4 shrink-0" />
+            {error}
+          </p>
+        )}
+
+        {!error && !loading && result && result.sessions.length === 0 && (
+          <EmptyState
+            title="No sessions found"
+            subtitle="No sessions found for the selected batch and date."
+          />
+        )}
+
+        {result && result.sessions.length > 0 && (
+          <div className="overflow-x-auto">
+            <div className="mb-3 flex flex-wrap items-center gap-2 text-sm text-slate-500">
+              <Badge>{result.batch}</Badge>
+              <Badge>{result.date}</Badge>
+            </div>
+            <table className="w-full min-w-[720px] text-left">
+              <thead>
+                <tr className="border-b border-slate-100 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  <th className="p-3">Subject / Teacher</th>
+                  <th className="p-3">Type</th>
+                  <th className="p-3">Time</th>
+                  <th className="p-3">Status</th>
+                  <th className="p-3 text-right">Enrolled</th>
+                  <th className="p-3 text-right">Attendance</th>
+                  <th className="p-3 text-right">Sent</th>
+                  <th className="p-3 text-right">Pending</th>
+                  <th className="p-3 text-right">Failed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.sessions.map((s) => (
+                  <tr key={s.id} className="border-b border-slate-100 last:border-0">
+                    <td className="p-3">
+                      <div className="text-sm font-semibold text-slate-800">
+                        {s.subject_name || "Untitled Subject"}
+                      </div>
+                      <div className="text-xs text-slate-400">
+                        {s.teacher_name || "Teacher not assigned"}
+                      </div>
+                    </td>
+                    <td className="p-3 text-sm text-slate-600">{s.type}</td>
+                    <td className="p-3 text-sm text-slate-600">{s.time}</td>
+                    <td className="p-3">
+                      <StatusPill status={s.status} />
+                    </td>
+                    <td className="p-3 text-right text-sm font-medium text-slate-700">
+                      {s.enrolled_student_count}
+                    </td>
+                    <td className="p-3 text-right text-sm font-medium text-slate-700">
+                      {s.attendance_count}
+                    </td>
+                    <td className="p-3 text-right text-sm font-medium text-emerald-600">{s.delivery.sent}</td>
+                    <td className="p-3 text-right text-sm font-medium text-amber-600">{s.delivery.pending}</td>
+                    <td className="p-3 text-right text-sm font-medium text-rose-600">{s.delivery.failed}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {!result && !error && !loading && (
+          <p className="text-sm text-slate-400">Select a batch and date, then generate a report.</p>
+        )}
+      </div>
     </div>
   );
 }
@@ -1201,6 +1475,485 @@ function DeliveryStatusModal({
 }
 
 /* =========================================================
+   STAFF — ENROLLED STUDENTS MODAL
+   Renders batch.students from the existing GET /api/staff/batches
+   response — no per-batch or per-student API calls.
+========================================================= */
+
+function EnrolledStudentsModal({
+  batch,
+  open,
+  onClose,
+}: {
+  batch: Batch | null;
+  open: boolean;
+  onClose: () => void;
+}) {
+  // Close on Escape, matching the other modals' behavior.
+  useEffect(() => {
+    if (!open) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open || !batch) return null;
+
+  const enrolledCount = enrolledCountOf(batch);
+  const students = batch.students;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true">
+      <div className="animate-fade-in absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onClick={onClose} />
+
+      <div className="animate-scale-in relative max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl bg-white p-6 shadow-2xl sm:p-7">
+        <div className="mb-5 flex items-start justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600">
+                <UsersIcon className="h-4 w-4" />
+              </span>
+              <h3 className="text-lg font-bold text-slate-900">{batch.name}</h3>
+            </div>
+            <p className="mt-2 text-sm font-medium text-slate-500">
+              {enrolledCount} enrolled student{enrolledCount === 1 ? "" : "s"}
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+            aria-label="Close"
+          >
+            <XIcon className="h-4 w-4" />
+          </button>
+        </div>
+
+        {!students ? (
+          <p className="rounded-xl border border-dashed border-slate-200 bg-slate-50/60 px-4 py-8 text-center text-sm text-slate-500">
+            Student information is unavailable.
+          </p>
+        ) : students.length === 0 ? (
+          <EmptyState title="No students enrolled" subtitle="This batch has no enrolled students yet." />
+        ) : (
+          <div className="overflow-x-auto rounded-xl border border-slate-100">
+            <table className="w-full min-w-[480px] text-left">
+              <thead>
+                <tr className="border-b border-slate-100 bg-slate-50/70 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  <th className="p-3">Student ID</th>
+                  <th className="p-3">Name</th>
+                  <th className="p-3">Email</th>
+                </tr>
+              </thead>
+              <tbody>
+                {students.map((student) => (
+                  <tr key={student.student_id} className="border-b border-slate-100 last:border-0">
+                    <td className="p-3 text-sm font-medium text-slate-500">{student.student_id}</td>
+                    <td className="p-3 text-sm font-semibold text-slate-800">{student.name}</td>
+                    <td className="p-3 text-sm text-slate-600">{student.email}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <div className="mt-7 flex justify-end">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 transition hover:bg-slate-100"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================
+   STAFF — ATTENDANCE MANAGEMENT
+   GET  /api/staff/sessions/{session_id}/attendance
+   PUT  /api/staff/sessions/{session_id}/attendance/{student_id}
+========================================================= */
+
+type AttendanceFilter = "ALL" | "PRESENT" | "ABSENT" | "NOT_MARKED";
+
+const ATTENDANCE_FILTER_LABEL: Record<AttendanceFilter, string> = {
+  ALL: "All",
+  PRESENT: "Present",
+  ABSENT: "Absent",
+  NOT_MARKED: "Not Marked",
+};
+
+const StaffAttendancePanel = React.forwardRef<
+  HTMLDivElement,
+  {
+    batches: Batch[];
+    sessions: Session[];
+    selectedBatchId: string;
+    selectedSessionId: string;
+    onSelectBatch: (batchId: string) => void;
+    onSelectSession: (sessionId: string) => void;
+    onBack: () => void;
+  }
+>(function StaffAttendancePanel(
+  { batches, sessions, selectedBatchId, selectedSessionId, onSelectBatch, onSelectSession, onBack },
+  ref
+) {
+  const [data, setData] = useState<StaffSessionAttendance | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState<AttendanceFilter>("ALL");
+  const [savingId, setSavingId] = useState<string | null>(null);
+
+  // Approved sessions are the only ones the backend allows attendance
+  // management for — mirrors the same rule already used for Deliver/Retry.
+  const approvedSessionsForBatch = useMemo(
+    () =>
+      sessions
+        .filter((s) => s.batch_id === selectedBatchId && s.status === "APPROVED")
+        .sort((a, b) => `${a.date}${a.time}`.localeCompare(`${b.date}${b.time}`)),
+    [sessions, selectedBatchId]
+  );
+
+  // Load the roster whenever the selected session changes. Reset local
+  // search/filter so a stale filter from a previous session doesn't hide
+  // students in the newly loaded one.
+  useEffect(() => {
+    setSearch("");
+    setFilter("ALL");
+    setMessage("");
+
+    if (!selectedSessionId) {
+      setData(null);
+      setError("");
+      return;
+    }
+
+    let cancelled = false;
+    setLoading(true);
+    setError("");
+
+    getStaffSessionAttendance(selectedSessionId)
+      .then((res) => {
+        if (!cancelled) setData(res);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(friendlyActionError(err, "staffAttendance"));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSessionId]);
+
+  async function mark(studentId: string, status: "PRESENT" | "ABSENT") {
+    if (!selectedSessionId || savingId) return;
+
+    setSavingId(studentId);
+    setMessage("");
+
+    try {
+      const updated = await updateStaffStudentAttendance(selectedSessionId, studentId, status);
+
+      // Apply the server's own response rather than assuming the
+      // requested status was accepted verbatim, then recompute counts
+      // from the resulting roster so the summary never drifts.
+      setData((prev) => {
+        if (!prev) return prev;
+        const students = prev.students.map((s) =>
+          s.student_id === studentId ? { ...s, ...updated } : s
+        );
+        const present = students.filter((s) => s.status === "PRESENT").length;
+        const absent = students.filter((s) => s.status === "ABSENT").length;
+        return {
+          ...prev,
+          students,
+          present_count: present,
+          absent_count: absent,
+          not_marked_count: students.length - present - absent,
+        };
+      });
+
+      setMessage(`Attendance marked ${status === "PRESENT" ? "Present" : "Absent"}.`);
+    } catch (err: any) {
+      setError(friendlyActionError(err, "staffAttendance"));
+    } finally {
+      setSavingId(null);
+    }
+  }
+
+  const filteredStudents = useMemo(() => {
+    if (!data) return [];
+    const q = search.trim().toLowerCase();
+
+    return data.students.filter((s) => {
+      const effectiveStatus: AttendanceFilter = (s.status ?? "NOT_MARKED") as AttendanceFilter;
+      const matchesFilter = filter === "ALL" || effectiveStatus === filter;
+      const matchesQuery =
+        !q ||
+        s.name.toLowerCase().includes(q) ||
+        s.email.toLowerCase().includes(q) ||
+        s.student_id.toLowerCase().includes(q);
+      return matchesFilter && matchesQuery;
+    });
+  }, [data, search, filter]);
+
+  const selectedBatch = batches.find((b) => b.id === selectedBatchId) || null;
+
+  return (
+    <div ref={ref} className="mb-8 overflow-hidden rounded-2xl border border-slate-200/70 bg-white shadow-sm shadow-slate-200/50">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 p-5">
+        <div className="flex items-center gap-3">
+          {selectedBatchId && (
+            <button
+              type="button"
+              onClick={onBack}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:bg-slate-50 hover:text-slate-700"
+              aria-label="Back to batches"
+            >
+              <ChevronLeftIcon className="h-4 w-4" />
+            </button>
+          )}
+          <div>
+            <h3 className="text-lg font-bold text-slate-900">Attendance Management</h3>
+            <p className="mt-1 text-sm text-slate-500">
+              {selectedBatch
+                ? `Batch: ${selectedBatch.name}`
+                : "Select a batch to view and manage student attendance."}
+            </p>
+          </div>
+        </div>
+        <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-cyan-50 text-cyan-600">
+          <UsersIcon className="h-4.5 w-4.5" />
+        </span>
+      </div>
+
+      {/* Step 1: batch cards */}
+      {!selectedBatchId && (
+        <div className="p-5">
+          {batches.length === 0 ? (
+            <EmptyState title="No batches found" subtitle="Create a batch to start managing attendance." />
+          ) : (
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+              {batches.map((batch) => {
+                const approvedCount = sessions.filter(
+                  (s) => s.batch_id === batch.id && s.status === "APPROVED"
+                ).length;
+                return (
+                  <div
+                    key={batch.id}
+                    className="animate-fade-in flex flex-col justify-between rounded-2xl border border-slate-200/70 bg-white p-5 shadow-sm shadow-slate-200/50 transition hover:-translate-y-0.5 hover:shadow-md"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-cyan-500 to-indigo-500 text-sm font-bold text-white shadow-sm">
+                        {getBatchInitials(batch.name)}
+                      </div>
+                      <div>
+                        <div className="text-xs font-medium uppercase tracking-wide text-slate-400">Batch</div>
+                        <div className="mt-0.5 text-lg font-bold text-slate-900">{batch.name}</div>
+                      </div>
+                    </div>
+
+                    <p className="mt-3 text-xs font-medium text-slate-400">
+                      {approvedCount === 0
+                        ? "No approved sessions yet"
+                        : `${approvedCount} approved session${approvedCount === 1 ? "" : "s"} available`}
+                    </p>
+
+                    <button
+                      type="button"
+                      onClick={() => onSelectBatch(batch.id)}
+                      className="mt-4 flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-slate-800"
+                    >
+                      <UsersIcon className="h-3.5 w-3.5" />
+                      View Attendance
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Step 2: session selector + roster */}
+      {selectedBatchId && (
+        <div className="p-5">
+          <div className="mb-5">
+            <label className="mb-1.5 block text-xs font-semibold text-slate-600">Session</label>
+            <div className="relative max-w-md">
+              <select
+                value={selectedSessionId}
+                onChange={(e) => onSelectSession(e.target.value)}
+                className="w-full appearance-none rounded-xl border border-slate-200 bg-slate-50 p-2.5 pr-9 text-sm text-slate-900 outline-none transition focus:border-indigo-400 focus:bg-white focus:ring-4 focus:ring-indigo-100"
+              >
+                <option value="">Select a session…</option>
+                {approvedSessionsForBatch.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {subjectNameOf(s)} · {s.type} · {s.date}
+                  </option>
+                ))}
+              </select>
+              <ChevronDownIcon className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            </div>
+
+            {approvedSessionsForBatch.length === 0 && (
+              <p className="mt-2 text-xs font-medium text-amber-600">
+                Attendance can be managed only for approved sessions. This batch has none yet.
+              </p>
+            )}
+          </div>
+
+          {!selectedSessionId ? (
+            <p className="rounded-xl border border-dashed border-slate-200 bg-slate-50/60 px-4 py-8 text-center text-sm text-slate-500">
+              Select a session above to view its attendance roster.
+            </p>
+          ) : loading ? (
+            <div className="flex flex-col items-center justify-center gap-3 py-14 text-slate-400">
+              <Spinner className="h-6 w-6" />
+              <p className="text-sm font-medium">Loading attendance...</p>
+            </div>
+          ) : error ? (
+            <div className="animate-fade-in flex flex-col items-center gap-3 rounded-xl border border-rose-200 bg-rose-50 px-5 py-10 text-center">
+              <span className="flex h-10 w-10 items-center justify-center rounded-full bg-rose-100 text-rose-600">
+                <XIcon className="h-5 w-5" />
+              </span>
+              <p className="text-sm font-semibold text-rose-700">{error}</p>
+            </div>
+          ) : data ? (
+            <div className="animate-fade-in space-y-5">
+              <MessagePanel message={message} onClear={() => setMessage("")} />
+
+              {/* Summary */}
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <ReportStatCard label="Enrolled" value={data.enrolled_count} accent="bg-indigo-50 text-indigo-700 ring-indigo-600/20" />
+                <ReportStatCard label="Present" value={data.present_count} accent="bg-emerald-50 text-emerald-700 ring-emerald-600/20" />
+                <ReportStatCard label="Absent" value={data.absent_count} accent="bg-rose-50 text-rose-700 ring-rose-600/20" />
+                <ReportStatCard label="Not Marked" value={data.not_marked_count} accent="bg-slate-100 text-slate-600 ring-slate-400/30" />
+              </div>
+
+              {/* Search + filters */}
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="relative flex-1 min-w-[220px]">
+                  <SearchIcon className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                  <input
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Search by name, email or student ID"
+                    className="w-full rounded-xl border border-slate-200 bg-slate-50 p-2.5 pl-9 text-sm text-slate-900 outline-none transition focus:border-indigo-400 focus:bg-white focus:ring-4 focus:ring-indigo-100"
+                  />
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {(Object.keys(ATTENDANCE_FILTER_LABEL) as AttendanceFilter[]).map((f) => (
+                    <button
+                      key={f}
+                      type="button"
+                      onClick={() => setFilter(f)}
+                      className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+                        filter === f
+                          ? "bg-slate-900 text-white shadow-sm"
+                          : "border border-slate-200 text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      {ATTENDANCE_FILTER_LABEL[f]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Roster */}
+              {filteredStudents.length === 0 ? (
+                <EmptyState title="No students found" subtitle="No students match your search." />
+              ) : (
+                <div className="overflow-x-auto rounded-xl border border-slate-100">
+                  <table className="w-full min-w-[720px] text-left">
+                    <thead>
+                      <tr className="border-b border-slate-100 bg-slate-50/70 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                        <th className="p-3.5">Student ID</th>
+                        <th className="p-3.5">Name</th>
+                        <th className="p-3.5">Email</th>
+                        <th className="p-3.5">Status</th>
+                        <th className="p-3.5">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredStudents.map((student) => {
+                        const effectiveStatus: AttendanceFilter = (student.status ??
+                          "NOT_MARKED") as AttendanceFilter;
+                        const isSaving = savingId === student.student_id;
+
+                        return (
+                          <tr
+                            key={student.student_id}
+                            className="border-b border-slate-100 transition last:border-0 hover:bg-slate-50/60"
+                          >
+                            <td className="p-3.5 text-sm font-medium text-slate-500">{student.student_id}</td>
+                            <td className="p-3.5 text-sm font-semibold text-slate-800">{student.name}</td>
+                            <td className="p-3.5 max-w-[220px] truncate text-sm text-slate-500" title={student.email}>
+                              {student.email}
+                            </td>
+                            <td className="p-3.5">
+                              <StatusPill status={effectiveStatus} label={effectiveStatus.replace(/_/g, " ")} />
+                            </td>
+                            <td className="p-3.5">
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  disabled={isSaving || student.status === "PRESENT"}
+                                  onClick={() => mark(student.student_id, "PRESENT")}
+                                  className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed ${
+                                    student.status === "PRESENT"
+                                      ? "bg-emerald-600 text-white shadow-sm disabled:opacity-100"
+                                      : "border border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
+                                  }`}
+                                >
+                                  {isSaving ? <Spinner className="h-3.5 w-3.5" /> : <CheckIcon className="h-3.5 w-3.5" />}
+                                  Present
+                                </button>
+
+                                <button
+                                  type="button"
+                                  disabled={isSaving || student.status === "ABSENT"}
+                                  onClick={() => mark(student.student_id, "ABSENT")}
+                                  className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed ${
+                                    student.status === "ABSENT"
+                                      ? "bg-rose-600 text-white shadow-sm disabled:opacity-100"
+                                      : "border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 disabled:opacity-50"
+                                  }`}
+                                >
+                                  {isSaving ? <Spinner className="h-3.5 w-3.5" /> : <XIcon className="h-3.5 w-3.5" />}
+                                  Absent
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+});
+
+/* =========================================================
    STAFF DASHBOARD
 ========================================================= */
 
@@ -1209,6 +1962,7 @@ function Staff() {
   const [batches, setBatches] = useState<Batch[]>([]);
   const [message, setMessage] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const [pendingDeliveries, setPendingDeliveries] = useState(0);
 
   // Which delivery/retry action is currently in flight, if any.
   const [actionState, setActionState] = useState<{ id: string; kind: "deliver" | "retry" } | null>(
@@ -1235,6 +1989,26 @@ function Staff() {
   const [statusError, setStatusError] = useState("");
   const statusOpen = statusSession !== null;
 
+  // Attendance Management (Staff — batch -> session -> roster).
+  const [attendanceBatchId, setAttendanceBatchId] = useState("");
+  const [attendanceSessionId, setAttendanceSessionId] = useState("");
+  const attendanceSectionRef = useRef<HTMLDivElement | null>(null);
+
+  // Enrolled Students modal (Staff — View Students per batch).
+  // Reuses the batches already loaded by load() below — no per-batch
+  // or per-student API calls.
+  const [selectedStudentsBatch, setSelectedStudentsBatch] = useState<Batch | null>(null);
+
+  // Jumps straight to a session's roster from the sessions table/report
+  // context, reusing the same Attendance Management panel and state.
+  function openAttendanceFor(session: Session) {
+    setAttendanceBatchId(session.batch_id);
+    setAttendanceSessionId(session.id);
+    requestAnimationFrame(() => {
+      attendanceSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
   async function load() {
     try {
       const [sessionData, batchData] = await Promise.all([
@@ -1244,8 +2018,23 @@ function Staff() {
 
       setSessions(sessionData);
       setBatches(batchData);
+
+      // Pending-deliveries count needs a per-session lookup — only fetch it
+      // for APPROVED sessions (the only ones that can have deliveries at all)
+      // and never let one failing lookup break the rest of the dashboard.
+      const approved = (sessionData as Session[]).filter((s) => s.status === "APPROVED");
+      const deliveryResults = await Promise.all(
+        approved.map((s) =>
+          api(`/api/sessions/${s.id}/deliveries`).catch(() => null)
+        )
+      );
+      const totalPending = deliveryResults.reduce(
+        (sum, d: any) => sum + (d ? Number(d.pending ?? 0) : 0),
+        0
+      );
+      setPendingDeliveries(totalPending);
     } catch (err: any) {
-      setMessage(err.message);
+      setMessage(friendlyActionError(err));
     }
   }
 
@@ -1276,7 +2065,7 @@ function Staff() {
 
       await load();
     } catch (err: any) {
-      setMessage(err.message);
+      setMessage(friendlyActionError(err, "deliver"));
     } finally {
       setActionState(null);
     }
@@ -1296,13 +2085,13 @@ function Staff() {
 
   async function handleCreateSubmit(values: SessionFormValues) {
     try {
-      const data = await api("/api/sessions", {
+      await api("/api/sessions", {
         method: "POST",
         body: JSON.stringify(values),
       });
 
       setModalOpen(false);
-      setMessage(`Session created successfully — status: ${data?.status || "DRAFT"}.`);
+      setMessage(`Session created successfully as Draft.`);
       await load();
     } catch (err: any) {
       throw new Error(friendlyError(err));
@@ -1312,6 +2101,8 @@ function Staff() {
   async function handleEditSubmit(values: SessionFormValues) {
     if (!editingSession) return;
 
+    const wasApproved = editingSession.status === "APPROVED";
+
     try {
       await api(`/api/sessions/${editingSession.id}`, {
         method: "PUT",
@@ -1319,7 +2110,11 @@ function Staff() {
       });
 
       setModalOpen(false);
-      setMessage("Session updated successfully.");
+      setMessage(
+        wasApproved
+          ? "Session updated. Reviewer approval is required again before delivery."
+          : "Session updated successfully."
+      );
       await load();
     } catch (err: any) {
       throw new Error(friendlyError(err));
@@ -1405,6 +2200,7 @@ function Staff() {
   }
 
   const approvedCount = sessions.filter((s) => s.status === "APPROVED").length;
+  const draftCount = sessions.filter((s) => s.status === "DRAFT").length;
 
   const reportBatchName =
     (reportSession && batches.find((b) => b.id === reportSession.batch_id)?.name) ||
@@ -1427,13 +2223,7 @@ function Staff() {
   return (
     <Shell title="Staff Dashboard" subtitle="Staff Portal" icon={<LayersIcon className="h-5 w-5" />}>
       {/* Stats */}
-      <div className="mb-8 grid gap-4 sm:grid-cols-3">
-        <StatCard
-          icon={<LayersIcon className="h-5 w-5 text-indigo-600" />}
-          label="Batches"
-          value={batches.length}
-          accent="bg-indigo-50"
-        />
+      <div className="mb-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
           icon={<CalendarIcon className="h-5 w-5 text-violet-600" />}
           label="Total Sessions"
@@ -1441,10 +2231,22 @@ function Staff() {
           accent="bg-violet-50"
         />
         <StatCard
+          icon={<PencilIcon className="h-5 w-5 text-amber-600" />}
+          label="Draft Sessions"
+          value={draftCount}
+          accent="bg-amber-50"
+        />
+        <StatCard
           icon={<CheckIcon className="h-5 w-5 text-emerald-600" />}
-          label="Ready to Deliver"
+          label="Approved Sessions"
           value={approvedCount}
           accent="bg-emerald-50"
+        />
+        <StatCard
+          icon={<ClockIcon className="h-5 w-5 text-rose-600" />}
+          label="Pending Deliveries"
+          value={pendingDeliveries}
+          accent="bg-rose-50"
         />
       </div>
 
@@ -1468,7 +2270,78 @@ function Staff() {
         </div>
       )}
 
+      {/* Enrolled Students */}
+      <div className="mb-8 overflow-hidden rounded-2xl border border-slate-200/70 bg-white shadow-sm shadow-slate-200/50">
+        <div className="border-b border-slate-100 p-5">
+          <h3 className="text-lg font-bold text-slate-900">Enrolled Students</h3>
+          <p className="mt-1 text-sm text-slate-500">View students enrolled in each batch.</p>
+        </div>
+
+        <div className="p-5">
+          {batches.length === 0 ? (
+            <EmptyState title="No batches found" subtitle="Create a batch to see enrolled students." />
+          ) : (
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+              {batches.map((batch) => {
+                const enrolledCount = enrolledCountOf(batch);
+                return (
+                  <div
+                    key={batch.id}
+                    className="card-accent-top animate-fade-in flex flex-col gap-4 rounded-2xl border border-slate-200/70 bg-white p-5 shadow-sm shadow-slate-200/50 transition hover:-translate-y-0.5 hover:shadow-md"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500 to-teal-500 text-sm font-bold text-white shadow-sm">
+                          {getBatchInitials(batch.name)}
+                        </div>
+                        <div>
+                          <div className="text-xs font-medium uppercase tracking-wide text-slate-400">Batch</div>
+                          <div className="mt-0.5 text-lg font-bold text-slate-900">{batch.name}</div>
+                        </div>
+                      </div>
+                      <span className="text-2xl font-extrabold text-slate-900">{enrolledCount}</span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 text-sm font-medium text-slate-500">
+                      <UsersIcon className="h-4 w-4" />
+                      {enrolledCount} enrolled
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setSelectedStudentsBatch(batch)}
+                      className="flex w-full items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-slate-800"
+                    >
+                      View Students
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
       <MessagePanel message={message} onClear={() => setMessage("")} />
+
+      <StaffAttendancePanel
+        ref={attendanceSectionRef}
+        batches={batches}
+        sessions={sessions}
+        selectedBatchId={attendanceBatchId}
+        selectedSessionId={attendanceSessionId}
+        onSelectBatch={(batchId) => {
+          setAttendanceBatchId(batchId);
+          setAttendanceSessionId("");
+        }}
+        onSelectSession={(sessionId) => setAttendanceSessionId(sessionId)}
+        onBack={() => {
+          setAttendanceBatchId("");
+          setAttendanceSessionId("");
+        }}
+      />
+
+      <StaffReportPanel batches={batches} />
 
       {/* Sessions */}
       <div className="overflow-hidden rounded-2xl border border-slate-200/70 bg-white shadow-sm shadow-slate-200/50">
@@ -1589,6 +2462,15 @@ function Staff() {
                               </button>
 
                               <button
+                                className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold text-cyan-600 underline-offset-2 transition hover:bg-cyan-50 hover:underline disabled:opacity-50"
+                                disabled={isActing}
+                                onClick={() => openAttendanceFor(session)}
+                              >
+                                <UsersIcon className="h-3.5 w-3.5" />
+                                Attendance
+                              </button>
+
+                              <button
                                 className="flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs font-semibold text-slate-500 transition hover:bg-slate-100"
                                 onClick={() => openEditModal(session)}
                               >
@@ -1624,6 +2506,7 @@ function Staff() {
         mode={modalMode}
         batches={batches}
         initialValues={modalInitialValues}
+        isApprovedEdit={modalMode === "edit" && editingSession?.status === "APPROVED"}
         onClose={() => setModalOpen(false)}
         onSubmit={modalMode === "create" ? handleCreateSubmit : handleEditSubmit}
       />
@@ -1646,6 +2529,12 @@ function Staff() {
         data={statusData}
         onClose={closeStatus}
       />
+
+      <EnrolledStudentsModal
+        batch={selectedStudentsBatch}
+        open={selectedStudentsBatch !== null}
+        onClose={() => setSelectedStudentsBatch(null)}
+      />
     </Shell>
   );
 }
@@ -1664,7 +2553,7 @@ function Reviewer() {
       const data = await api("/api/sessions");
       setSessions(data);
     } catch (err: any) {
-      setMessage(err.message);
+      setMessage(friendlyActionError(err));
     }
   }
 
@@ -1685,7 +2574,7 @@ function Reviewer() {
 
       await load();
     } catch (err: any) {
-      setMessage(err.message);
+      setMessage(friendlyActionError(err, "approve"));
     } finally {
       setLoading(false);
     }
@@ -1782,7 +2671,7 @@ function Student() {
       const data = await api("/api/student/sessions");
       setSessions(data);
     } catch (err: any) {
-      setMessage(err.message);
+      setMessage(friendlyActionError(err));
     }
   }
 
@@ -1817,7 +2706,7 @@ function Student() {
         `Attendance submitted: ${attendanceStatus}`
       );
     } catch (err: any) {
-      setMessage(err.message);
+      setMessage(friendlyActionError(err, "attendance"));
     } finally {
       setLoadingId(null);
     }

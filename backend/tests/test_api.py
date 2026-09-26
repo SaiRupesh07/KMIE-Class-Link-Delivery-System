@@ -186,6 +186,51 @@ def test_duplicate_attendance_and_batch_isolation():
         for session in neha_sessions
     )
 
+    # ---------------------------------------------------------
+    # 8. Batch isolation on WRITE, not just read:
+    #    Neha (BATCH-B) must not be able to submit attendance
+    #    against Rahul's BATCH-A session, even using her own
+    #    student_id, and no attendance row must be created for it.
+    # ---------------------------------------------------------
+    neha_login = client.post(
+        "/api/auth/login",
+        json={
+            "email": "neha@example.com",
+            "password": "Student@123"
+        }
+    )
+
+    assert neha_login.status_code == 200
+
+    neha_student_id = neha_login.json()["user"]["student_id"]
+
+    neha_attendance_response = client.post(
+        f"/api/student/sessions/{session_id}/attendance",
+        headers=auth(neha_token),
+        json={
+            "student_id": neha_student_id,
+            "status": "PRESENT"
+        }
+    )
+
+    assert neha_attendance_response.status_code == 403
+
+    # Confirm no attendance row was created for the cross-batch attempt:
+    # the session's attendance_count must still be exactly 1 (Rahul's).
+    report_response = client.get(
+        "/api/staff/report",
+        headers=auth(staff_token),
+        params={"batch_id": "batch-a", "date": "2026-09-26"}
+    )
+
+    assert report_response.status_code == 200
+
+    report_session = next(
+        s for s in report_response.json()["sessions"] if s["id"] == session_id
+    )
+
+    assert report_session["attendance_count"] == 1
+
 
 def test_student_cannot_approve_or_deliver():
     token = login(
@@ -427,3 +472,395 @@ def test_staff_report_contains_subject_and_teacher():
     assert "attendance_count" in matching
     assert "delivery" in matching
     assert set(matching["delivery"].keys()) == {"sent", "failed", "pending"}
+
+
+def test_delivery_partial_retry_idempotency():
+    # Proves the full delivery lifecycle end-to-end:
+    #   - DRAFT sessions cannot be delivered (409)
+    #   - initial delivery sends exactly 2 of 3 eligible recipients,
+    #     the 3rd stays PENDING
+    #   - retry-delivery resumes only the remaining recipient(s)
+    #   - already-SENT recipients are never resent (no duplicate
+    #     LinkDelivery rows, attempt_count unchanged)
+    #   - a second retry is a true no-op (idempotent)
+    staff_token = login("staff@example.com", "Staff@123")
+    reviewer_token = login("reviewer@example.com", "Reviewer@123")
+
+    # 3. Create a new BATCH-A session on a date that doesn't collide
+    # with any other seeded/test session.
+    create_response = client.post(
+        "/api/sessions",
+        headers=auth(staff_token),
+        json={
+            "batch_id": "batch-a",
+            "date": "2026-10-05",
+            "type": "LIVE",
+            "time": "09:00:00",
+            "zoom_url": "https://zoom.example.com/delivery-retry-test",
+            "subject_name": "Physics",
+            "teacher_name": "Dr. Ravi Kumar"
+        }
+    )
+    assert create_response.status_code == 201
+    session_id = create_response.json()["id"]
+
+    # 4. Confirm it is DRAFT.
+    assert create_response.json()["status"] == "DRAFT"
+
+    # 5-6. Delivery before approval must be rejected.
+    early_deliver_response = client.post(
+        f"/api/sessions/{session_id}/deliver",
+        headers=auth(staff_token)
+    )
+    assert early_deliver_response.status_code == 409
+
+    # 7. Reviewer approves the session.
+    approve_response = client.post(
+        f"/api/sessions/{session_id}/approve",
+        headers=auth(reviewer_token)
+    )
+    assert approve_response.status_code == 200
+    assert approve_response.json()["status"] == "APPROVED"
+
+    # 8-9. Initial delivery: 2 SENT, 1 PENDING, 0 FAILED, 3 recipients.
+    deliver_response = client.post(
+        f"/api/sessions/{session_id}/deliver",
+        headers=auth(staff_token)
+    )
+    assert deliver_response.status_code == 200
+
+    first = deliver_response.json()
+    assert first["sent"] == 2
+    assert first["pending"] == 1
+    assert first["failed"] == 0
+    assert len(first["recipients"]) == 3
+
+    # 10-11. The 2 SENT recipients have attempt_count == 1; the
+    # remaining recipient is PENDING with attempt_count == 0.
+    sent_after_first = [r for r in first["recipients"] if r["status"] == "SENT"]
+    pending_after_first = [r for r in first["recipients"] if r["status"] == "PENDING"]
+
+    assert len(sent_after_first) == 2
+    assert len(pending_after_first) == 1
+    assert all(r["attempt_count"] == 1 for r in sent_after_first)
+    assert pending_after_first[0]["attempt_count"] == 0
+
+    sent_student_ids_after_first = {r["student_id"] for r in sent_after_first}
+
+    # 12-13. Retry: all 3 now SENT, 0 pending, 0 failed.
+    retry_response = client.post(
+        f"/api/sessions/{session_id}/retry-delivery",
+        headers=auth(staff_token)
+    )
+    assert retry_response.status_code == 200
+
+    second = retry_response.json()
+    assert second["sent"] == 3
+    assert second["pending"] == 0
+    assert second["failed"] == 0
+
+    # 14-15. Exactly 3 recipients, no duplicate LinkDelivery rows (unique
+    # student_ids), and the 2 originally-SENT recipients were not resent.
+    assert len(second["recipients"]) == 3
+    student_ids_after_retry = {r["student_id"] for r in second["recipients"]}
+    assert len(student_ids_after_retry) == 3
+
+    unchanged_recipients = {
+        r["student_id"]: r["attempt_count"] for r in second["recipients"]
+        if r["student_id"] in sent_student_ids_after_first
+    }
+    assert all(count == 1 for count in unchanged_recipients.values())
+
+    # 16. All three recipients now have attempt_count == 1 (each was
+    # sent exactly once total, whether on initial delivery or retry).
+    assert all(r["attempt_count"] == 1 for r in second["recipients"])
+
+    # 17-18. Retry again: fully idempotent, no state or count changes.
+    retry_again_response = client.post(
+        f"/api/sessions/{session_id}/retry-delivery",
+        headers=auth(staff_token)
+    )
+    assert retry_again_response.status_code == 200
+
+    third = retry_again_response.json()
+    assert third["sent"] == 3
+    assert third["pending"] == 0
+    assert third["failed"] == 0
+    assert len(third["recipients"]) == 3
+    assert {r["student_id"] for r in third["recipients"]} == student_ids_after_retry
+    assert all(r["attempt_count"] == 1 for r in third["recipients"])
+
+    # 19. GET /deliveries reflects the same final, idempotent state.
+    deliveries_response = client.get(
+        f"/api/sessions/{session_id}/deliveries",
+        headers=auth(staff_token)
+    )
+    assert deliveries_response.status_code == 200
+
+    final = deliveries_response.json()
+    assert final["sent"] == 3
+    assert final["pending"] == 0
+    assert final["failed"] == 0
+    assert len(final["recipients"]) == 3
+    assert all(r["attempt_count"] == 1 for r in final["recipients"])
+
+# ---------------------------------------------------------
+# Staff attendance management (roster view + mark/update)
+# ---------------------------------------------------------
+
+def get_student_id(email, password):
+    response = client.post(
+        "/api/auth/login",
+        json={"email": email, "password": password}
+    )
+    assert response.status_code == 200
+    return response.json()["user"]["student_id"]
+
+
+def create_and_approve_session(staff_token, reviewer_token, date_str, batch_id="batch-a"):
+    create_response = client.post(
+        "/api/sessions",
+        headers=auth(staff_token),
+        json={
+            "batch_id": batch_id,
+            "date": date_str,
+            "type": "LIVE",
+            "time": "09:00:00",
+            "zoom_url": f"https://zoom.example.com/attendance-{date_str}",
+            "subject_name": "Chemistry",
+            "teacher_name": "Dr. Ravi Kumar"
+        }
+    )
+    assert create_response.status_code == 201
+    session_id = create_response.json()["id"]
+
+    approve_response = client.post(
+        f"/api/sessions/{session_id}/approve",
+        headers=auth(reviewer_token)
+    )
+    assert approve_response.status_code == 200
+
+    return session_id
+
+
+def test_staff_attendance_roster_full_details():
+    # TEST 1: Staff can retrieve the complete attendance roster for a
+    # session, with correct session/batch info, every enrolled BATCH-A
+    # student, correct names/emails, and correct counts before anything
+    # has been marked.
+    staff_token = login("staff@example.com", "Staff@123")
+    reviewer_token = login("reviewer@example.com", "Reviewer@123")
+
+    session_id = create_and_approve_session(staff_token, reviewer_token, "2026-10-06")
+
+    roster_response = client.get(
+        f"/api/staff/sessions/{session_id}/attendance",
+        headers=auth(staff_token)
+    )
+    assert roster_response.status_code == 200
+
+    roster = roster_response.json()
+    assert roster["session_id"] == session_id
+    assert roster["batch_id"] == "batch-a"
+    assert roster["batch_name"] == "BATCH-A"
+    assert roster["subject_name"] == "Chemistry"
+    assert roster["teacher_name"] == "Dr. Ravi Kumar"
+
+    students = roster["students"]
+    names = {s["name"] for s in students}
+    emails = {s["email"] for s in students}
+
+    assert names == {"Rahul", "Priya", "Arjun"}
+    assert emails == {"rahul@example.com", "priya@example.com", "arjun@example.com"}
+    assert all(s["batch_id"] == "batch-a" for s in students)
+    assert all(s["attendance_status"] is None for s in students)
+
+    assert roster["enrolled_count"] == 3
+    assert roster["present_count"] == 0
+    assert roster["absent_count"] == 0
+    assert roster["not_marked_count"] == 3
+
+
+def test_staff_can_mark_and_change_attendance():
+    # TEST 2 + TEST 3 + TEST 4:
+    # Staff can mark PRESENT (row created), mark ABSENT (row updated,
+    # not duplicated), and flip PRESENT -> ABSENT -> PRESENT with the
+    # roster counts staying consistent throughout (no duplicate rows).
+    staff_token = login("staff@example.com", "Staff@123")
+    reviewer_token = login("reviewer@example.com", "Reviewer@123")
+    rahul_id = get_student_id("rahul@example.com", "Student@123")
+
+    session_id = create_and_approve_session(staff_token, reviewer_token, "2026-10-07")
+
+    # Mark PRESENT (creates a new Attendance row).
+    mark_present = client.put(
+        f"/api/staff/sessions/{session_id}/attendance/{rahul_id}",
+        headers=auth(staff_token),
+        json={"status": "PRESENT"}
+    )
+    assert mark_present.status_code == 200
+    assert mark_present.json()["attendance_status"] == "PRESENT"
+
+    roster_after_present = client.get(
+        f"/api/staff/sessions/{session_id}/attendance",
+        headers=auth(staff_token)
+    ).json()
+    assert roster_after_present["present_count"] == 1
+    assert roster_after_present["absent_count"] == 0
+    assert roster_after_present["not_marked_count"] == 2
+
+    # PRESENT -> ABSENT (updates the same row, no duplicate).
+    mark_absent = client.put(
+        f"/api/staff/sessions/{session_id}/attendance/{rahul_id}",
+        headers=auth(staff_token),
+        json={"status": "ABSENT"}
+    )
+    assert mark_absent.status_code == 200
+    assert mark_absent.json()["attendance_status"] == "ABSENT"
+
+    roster_after_absent = client.get(
+        f"/api/staff/sessions/{session_id}/attendance",
+        headers=auth(staff_token)
+    ).json()
+    assert roster_after_absent["present_count"] == 0
+    assert roster_after_absent["absent_count"] == 1
+    assert roster_after_absent["not_marked_count"] == 2
+
+    # ABSENT -> PRESENT again (still one row, not two).
+    mark_present_again = client.put(
+        f"/api/staff/sessions/{session_id}/attendance/{rahul_id}",
+        headers=auth(staff_token),
+        json={"status": "PRESENT"}
+    )
+    assert mark_present_again.status_code == 200
+    assert mark_present_again.json()["attendance_status"] == "PRESENT"
+
+    roster_final = client.get(
+        f"/api/staff/sessions/{session_id}/attendance",
+        headers=auth(staff_token)
+    ).json()
+    assert roster_final["present_count"] == 1
+    assert roster_final["absent_count"] == 0
+    assert roster_final["not_marked_count"] == 2
+    assert roster_final["enrolled_count"] == 3
+
+
+def test_staff_attendance_cross_batch_rejected():
+    # TEST 5: A BATCH-A session cannot have attendance marked for a
+    # BATCH-B student. Must return 403, and no attendance row/state
+    # change results from the attempt.
+    staff_token = login("staff@example.com", "Staff@123")
+    reviewer_token = login("reviewer@example.com", "Reviewer@123")
+    neha_id = get_student_id("neha@example.com", "Student@123")
+
+    session_id = create_and_approve_session(staff_token, reviewer_token, "2026-10-08")
+
+    cross_batch_response = client.put(
+        f"/api/staff/sessions/{session_id}/attendance/{neha_id}",
+        headers=auth(staff_token),
+        json={"status": "PRESENT"}
+    )
+    assert cross_batch_response.status_code == 403
+
+    roster = client.get(
+        f"/api/staff/sessions/{session_id}/attendance",
+        headers=auth(staff_token)
+    ).json()
+    assert roster["not_marked_count"] == 3
+    assert all(s["attendance_status"] is None for s in roster["students"])
+    assert all(s["student_id"] != neha_id for s in roster["students"])
+
+
+def test_staff_attendance_endpoints_require_staff_role():
+    # TEST 6: Neither a STUDENT nor a REVIEWER token may use the staff
+    # attendance endpoints (roster or mark/update).
+    staff_token = login("staff@example.com", "Staff@123")
+    reviewer_token = login("reviewer@example.com", "Reviewer@123")
+    student_token = login("rahul@example.com", "Student@123")
+    rahul_id = get_student_id("rahul@example.com", "Student@123")
+
+    session_id = create_and_approve_session(staff_token, reviewer_token, "2026-10-09")
+
+    for token in (student_token, reviewer_token):
+        roster_response = client.get(
+            f"/api/staff/sessions/{session_id}/attendance",
+            headers=auth(token)
+        )
+        assert roster_response.status_code == 403
+
+        update_response = client.put(
+            f"/api/staff/sessions/{session_id}/attendance/{rahul_id}",
+            headers=auth(token),
+            json={"status": "PRESENT"}
+        )
+        assert update_response.status_code == 403
+
+
+def test_staff_attendance_draft_session_rejected():
+    # TEST 7: Marking attendance on a DRAFT (not yet approved) session
+    # must be rejected with 409, and must not create an Attendance row.
+    # The roster GET itself still works on a DRAFT session so staff can
+    # see who is enrolled before approval.
+    staff_token = login("staff@example.com", "Staff@123")
+    rahul_id = get_student_id("rahul@example.com", "Student@123")
+
+    create_response = client.post(
+        "/api/sessions",
+        headers=auth(staff_token),
+        json={
+            "batch_id": "batch-a",
+            "date": "2026-10-10",
+            "type": "LIVE",
+            "time": "09:00:00",
+            "zoom_url": "https://zoom.example.com/attendance-draft",
+            "subject_name": "Chemistry",
+            "teacher_name": "Dr. Ravi Kumar"
+        }
+    )
+    assert create_response.status_code == 201
+    session_id = create_response.json()["id"]
+    assert create_response.json()["status"] == "DRAFT"
+
+    draft_update_response = client.put(
+        f"/api/staff/sessions/{session_id}/attendance/{rahul_id}",
+        headers=auth(staff_token),
+        json={"status": "PRESENT"}
+    )
+    assert draft_update_response.status_code == 409
+
+    roster_response = client.get(
+        f"/api/staff/sessions/{session_id}/attendance",
+        headers=auth(staff_token)
+    )
+    assert roster_response.status_code == 200
+    roster = roster_response.json()
+    assert roster["session_status"] == "DRAFT"
+    assert roster["not_marked_count"] == 3
+    assert all(s["attendance_status"] is None for s in roster["students"])
+
+
+def test_student_attendance_endpoint_still_works():
+    # TEST 8: The existing student self-attendance endpoint remains
+    # fully functional after adding the staff attendance API.
+    staff_token = login("staff@example.com", "Staff@123")
+    reviewer_token = login("reviewer@example.com", "Reviewer@123")
+    student_token = login("priya@example.com", "Student@123")
+    priya_id = get_student_id("priya@example.com", "Student@123")
+
+    session_id = create_and_approve_session(staff_token, reviewer_token, "2026-10-11")
+
+    response = client.post(
+        f"/api/student/sessions/{session_id}/attendance",
+        headers=auth(student_token),
+        json={"student_id": priya_id, "status": "PRESENT"}
+    )
+    assert response.status_code == 201
+    assert response.json()["status"] == "PRESENT"
+
+    # Staff roster reflects the student's own submission too.
+    roster = client.get(
+        f"/api/staff/sessions/{session_id}/attendance",
+        headers=auth(staff_token)
+    ).json()
+    priya_row = next(s for s in roster["students"] if s["student_id"] == priya_id)
+    assert priya_row["attendance_status"] == "PRESENT"
